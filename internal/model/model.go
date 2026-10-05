@@ -29,8 +29,9 @@ func (r Resources) IsZero() bool { return r.MilliCPU == 0 && r.MemoryMB == 0 }
 type NodeState string
 
 const (
-	NodeStateReady   NodeState = "Ready"
-	NodeStateOffline NodeState = "Offline" // 失联或维护，不可放置
+	NodeStateReady    NodeState = "Ready"
+	NodeStateOffline  NodeState = "Offline"  // 失联或维护，不可放置
+	NodeStateDraining NodeState = "Draining" // 维护排空：不接收新实例，正在疏散存量
 )
 
 // Node 表示一个宿主节点。
@@ -51,13 +52,15 @@ func (n *Node) HasCapacity(req Resources) bool {
 type VMState string
 
 const (
-	VMStatePlacing  VMState = "Placing"  // 已记账，正在后端创建
-	VMStateStopped  VMState = "Stopped"  // 已创建未运行
-	VMStateStarting VMState = "Starting" // 正在启动
-	VMStateRunning  VMState = "Running"
-	VMStateStopping VMState = "Stopping"
-	VMStateFailed   VMState = "Failed"  // 明确终态：后端结果不确定或失败且已回收资源
-	VMStateDeleted  VMState = "Deleted" // 明确终态：资源已释放
+	VMStatePlacing   VMState = "Placing"  // 已记账，正在后端创建
+	VMStateStopped   VMState = "Stopped"  // 已创建未运行
+	VMStateStarting  VMState = "Starting" // 正在启动
+	VMStateRunning   VMState = "Running"
+	VMStateStopping  VMState = "Stopping"
+	VMStateDeleting  VMState = "Deleting"  // 删除已认领、后端删除在途，阻止并发删除重复回收
+	VMStateMigrating VMState = "Migrating" // 维护排空中：正在从源节点疏散到目标节点
+	VMStateFailed    VMState = "Failed"    // 明确终态：后端结果不确定或失败且已回收资源
+	VMStateDeleted   VMState = "Deleted"   // 明确终态：资源已释放
 )
 
 // Terminal 判断是否为终态。

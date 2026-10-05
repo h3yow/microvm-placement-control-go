@@ -55,8 +55,36 @@ func main() {
 	fmt.Printf("stopped %s state=%s\n", vm.ID, vm.State)
 	must(cp.DeleteVM(ctx, vm.ID))
 
-	n, _ := cp.NodeSnapshot(vm.NodeID)
-	fmt.Printf("node %s allocated after delete: %+v\n", n.ID, n.Allocated)
+	na0, _ := cp.NodeSnapshot(vm.NodeID)
+	fmt.Printf("node %s allocated after delete: %+v\n", na0.ID, na0.Allocated)
+
+	// === 节点维护排空与实例疏散 ===
+	fmt.Println("\n=== node maintenance drain ===")
+	dSpec := model.VMSpec{RequestID: "drain-1", Resources: model.Resources{MilliCPU: 1000, MemoryMB: 1024}}
+	dvm, err := cp.CreateVM(ctx, dSpec)
+	must(err)
+	fmt.Printf("created %s on %s\n", dvm.ID, dvm.NodeID)
+
+	dres, err := cp.DrainNode(ctx, "node-a")
+	must(err)
+	for _, r := range dres.Results {
+		status := "stayed " + r.FromNode
+		if r.Evacuated {
+			status = fmt.Sprintf("moved %s -> %s", r.FromNode, r.ToNode)
+		} else {
+			status += fmt.Sprintf(" (%s: %s)", r.ReasonCode, r.Reason)
+		}
+		fmt.Printf("drain result: %s %s state=%s\n", r.VMID, status, r.State)
+	}
+	if na, _ := cp.NodeSnapshot("node-a"); na.Allocated.IsZero() {
+		must(cp.EndMaintenance(ctx, "node-a"))
+		fmt.Println("node-a fully drained, maintenance ended (back to Ready)")
+	}
+	// 重复排空幂等：已搬走的实例不会再搬。
+	dres2, err := cp.DrainNode(ctx, "node-a")
+	must(err)
+	fmt.Printf("repeated drain is idempotent: evacuated=%d remaining=%d\n", dres2.Evacuated(), dres2.Remaining())
+	must(cp.DeleteVM(ctx, dvm.ID))
 
 	fmt.Println("\n=== audit log ===")
 	for _, e := range cp.Audit() {

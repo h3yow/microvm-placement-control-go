@@ -131,6 +131,11 @@ func (c *ControlPlane) StartVM(ctx context.Context, vmID string) (*model.MicroVM
 		c.mu.Unlock()
 		return nil, newErr(ReasonNotFound, "vm %s not found", vmID)
 	}
+	// 疏散搬移中的实例由排空流程原子收敛，外部启动/停止会破坏“同一时刻只有一份占账”的不变量。
+	if vm.State == model.VMStateMigrating {
+		c.mu.Unlock()
+		return nil, newErr(ReasonInvalidState, "vm %s is migrating during node drain; retry later", vmID)
+	}
 	switch vm.State {
 	case model.VMStateRunning:
 		cp := *vm
@@ -195,6 +200,10 @@ func (c *ControlPlane) StopVM(ctx context.Context, vmID string) (*model.MicroVM,
 		c.mu.Unlock()
 		return nil, newErr(ReasonNotFound, "vm %s not found", vmID)
 	}
+	if vm.State == model.VMStateMigrating {
+		c.mu.Unlock()
+		return nil, newErr(ReasonInvalidState, "vm %s is migrating during node drain; retry later", vmID)
+	}
 	switch vm.State {
 	case model.VMStateStopped:
 		cp := *vm
@@ -231,6 +240,9 @@ func (c *ControlPlane) StopVM(ctx context.Context, vmID string) (*model.MicroVM,
 // DeleteVM 删除微虚拟机并释放全部账目。幂等：重复删除返回成功。
 // 任何状态下均可删除（终态收敛手段）；后端删除失败时资源仍回收，
 // 实例进入 Deleted 并记录后端残留，保证控制面账目守恒。
+//
+// 并发安全：首个调用在锁内“认领”删除（置 Deleting），重复并发调用在收敛前等待、
+// 收敛后按幂等成功返回；只有认领者释放一次账目，杜绝重复回收导致已用量变负。
 func (c *ControlPlane) DeleteVM(ctx context.Context, vmID string) error {
 	c.mu.Lock()
 	vm, ok := c.vms[vmID]
@@ -242,6 +254,24 @@ func (c *ControlPlane) DeleteVM(ctx context.Context, vmID string) error {
 		c.mu.Unlock()
 		return nil
 	}
+	if vm.State == model.VMStateMigrating {
+		c.mu.Unlock()
+		return newErr(ReasonInvalidState, "vm %s is migrating during node drain; retry later", vmID)
+	}
+	if vm.State == model.VMStateDeleting {
+		// 已有并发删除在途：等待其收敛后按幂等成功返回。
+		wait := make(chan struct{})
+		c.delWaits[vmID] = append(c.delWaits[vmID], wait)
+		c.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return nil
+	}
+	claimNode := vm.NodeID
+	vm.State = model.VMStateDeleting // 认领删除，阻止并发删除重复回收
 	be := c.backendFor(c.nodes[vm.NodeID])
 	c.mu.Unlock()
 
@@ -249,14 +279,40 @@ func (c *ControlPlane) DeleteVM(ctx context.Context, vmID string) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.release(vm.NodeID, vm.Spec.Resources)
+	// 防御性校验：认领删除后实例不应再被疏散（排空会跳过 Deleting）。若检测到节点
+	// 已漂移，绝不能按旧节点释放（账已随搬移划转），把删除留待调用方在新节点重试。
+	if vm.NodeID != claimNode {
+		vm.State = model.VMStateStopped // 回滚认领，交由重试路径处理
+		c.log("vm.delete.deferred", vmID, vm.NodeID,
+			"node drifted to "+vm.NodeID+" during delete; release deferred")
+		waiters := c.delWaits[vmID]
+		delete(c.delWaits, vmID)
+		c.mu.Unlock()
+		for _, w := range waiters {
+			close(w)
+		}
+		c.mu.Lock()
+		return newErr(ReasonInvalidState, "vm %s moved to %s during delete; retry", vmID, vm.NodeID)
+	}
+	c.release(claimNode, vm.Spec.Resources)
 	vm.State = model.VMStateDeleted
 	if err != nil {
 		vm.Reason = string(ReasonBackend) + ": delete failed, resources reclaimed, backend residue possible: " + err.Error()
-		c.log("vm.delete.residue", vmID, vm.NodeID, vm.Reason)
+		c.log("vm.delete.residue", vmID, claimNode, vm.Reason)
+	} else {
+		vm.Reason = ""
+		c.log("vm.delete", vmID, claimNode, "deleted, resources released")
+	}
+	// 唤醒等待同一实例删除结果的并发调用（锁外 close，避免回调方抢锁）。
+	waiters := c.delWaits[vmID]
+	delete(c.delWaits, vmID)
+	c.mu.Unlock()
+	for _, w := range waiters {
+		close(w)
+	}
+	c.mu.Lock()
+	if err != nil {
 		return newErr(ReasonBackend, "vm %s deleted with backend residue: %v", vmID, err)
 	}
-	vm.Reason = ""
-	c.log("vm.delete", vmID, vm.NodeID, "deleted, resources released")
 	return nil
 }

@@ -8,6 +8,23 @@ import (
 	"github.com/h3yow/microvm-placement-control-go/internal/model"
 )
 
+// moveCtx 记录一次进行中的疏散搬移（锁内发布、锁内终结）。
+// 搬移期间源节点保留实例记账、目标节点临时等额记账，全局 used 不变，
+// 从而保证全局不重复占账且配额不被搬移本身消耗。
+type moveCtx struct {
+	vmID      string
+	from      string
+	to        string
+	prevState model.VMState
+	degraded  []string
+}
+
+// drainState 记录节点本轮维护（进入 Draining 至结束维护）内累计的成功疏散结果，
+// 使重复排空在不重复搬移的同时仍能给出完整的逐实例结果。
+type drainState struct {
+	evacuated map[string]VMResult
+}
+
 // AuditEvent 记录一次状态或资源账目变更，用于可解释性与审计。
 type AuditEvent struct {
 	Seq    int64
@@ -29,6 +46,10 @@ type ControlPlane struct {
 	seq        int64
 	audit      []AuditEvent
 	backendFor func(node *model.Node) backend.Backend
+	moving     map[string]*moveCtx        // vmID -> 进行中的疏散搬移
+	gates      map[string]*sync.Mutex     // 每节点排空串行化门控
+	drains     map[string]*drainState     // nodeID -> 本轮维护的累计疏散状态
+	delWaits   map[string][]chan struct{} // vmID -> 等待并发删除收敛的通道
 }
 
 // New 创建控制面。backendFor 按节点解析后端（测试可注入伪后端）。
@@ -39,7 +60,21 @@ func New(quota model.Resources, backendFor func(*model.Node) backend.Backend) *C
 		byReqID:    map[string]string{},
 		quota:      quota,
 		backendFor: backendFor,
+		moving:     map[string]*moveCtx{},
+		gates:      map[string]*sync.Mutex{},
+		drains:     map[string]*drainState{},
+		delWaits:   map[string][]chan struct{}{},
 	}
+}
+
+// nodeGateLocked 返回节点级排空门控（惰性创建；调用方须持 c.mu 取得门控，锁外加锁）。
+func (c *ControlPlane) nodeGateLocked(nodeID string) *sync.Mutex {
+	g, ok := c.gates[nodeID]
+	if !ok {
+		g = &sync.Mutex{}
+		c.gates[nodeID] = g
+	}
+	return g
 }
 
 // log 追加审计事件（须持锁）。
@@ -61,7 +96,10 @@ func (c *ControlPlane) RegisterNode(node model.Node) error {
 		}
 		existing.Capacity = node.Capacity
 		existing.Capabilities = node.Capabilities
-		existing.State = node.State
+		// 维护排空是显式生命周期：重登记不得把 Draining 节点悄悄改回可放置状态。
+		if existing.State != model.NodeStateDraining {
+			existing.State = node.State
+		}
 		c.log("node.update", "", node.ID, "node re-registered")
 		return nil
 	}
@@ -82,6 +120,12 @@ func (c *ControlPlane) SetNodeState(nodeID string, state model.NodeState) error 
 	if !ok {
 		return newErr(ReasonNotFound, "node %s not found", nodeID)
 	}
+	// Draining 是显式维护生命周期：不能经失联状态接口直接改写，
+	// 结束维护必须走 EndMaintenance（先排空再 Ready）。
+	if n.State == model.NodeStateDraining && state != model.NodeStateDraining {
+		return newErr(ReasonInvalidState,
+			"node %s is draining; use EndMaintenance after evacuation instead of forcing %s", nodeID, state)
+	}
 	n.State = state
 	c.log("node.state", "", nodeID, "state="+string(state))
 	return nil
@@ -98,6 +142,12 @@ func (c *ControlPlane) RemoveNode(nodeID string) error {
 	for _, vm := range c.vms {
 		if vm.NodeID == nodeID && vm.State != model.VMStateDeleted {
 			return newErr(ReasonInvalidState, "node %s still hosts vm %s", nodeID, vm.ID)
+		}
+	}
+	// 进行中的疏散把该节点作为源或目标时也拒绝，防止端点头像被删导致账目悬挂。
+	for _, m := range c.moving {
+		if m.from == nodeID || m.to == nodeID {
+			return newErr(ReasonInvalidState, "node %s has in-flight evacuation", nodeID)
 		}
 	}
 	c.used = c.used.Sub(n.Allocated)
@@ -258,6 +308,8 @@ func labelsMatch(nodeCaps, required map[string]string) bool {
 }
 
 // hasAntiAffinityConflict 判断节点上是否已有相同反亲和键的活跃 VM（须持锁）。
+// 疏散搬移中、账目已划转到目标节点的 Migrating 实例通过 vm.NodeID 一并计入
+// （账面单点），防止并发排空把同键实例搬到同一节点。
 func (c *ControlPlane) hasAntiAffinityConflict(nodeID, key string) bool {
 	for _, vm := range c.vms {
 		if vm.NodeID == nodeID && vm.Spec.AntiAffinityKey == key && vm.State != model.VMStateDeleted && vm.State != model.VMStateFailed {
