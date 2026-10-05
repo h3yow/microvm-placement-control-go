@@ -21,6 +21,7 @@ type AuditEvent struct {
 // 后端调用在锁外执行，结果通过收敛逻辑写回，保证并发一致性。
 type ControlPlane struct {
 	mu         sync.Mutex
+	drainMu    sync.Mutex // 串行化排空操作，保证同一（或不同）节点的重复/并发排空幂等
 	nodes      map[string]*model.Node
 	vms        map[string]*model.MicroVM
 	byReqID    map[string]string // requestID -> vmID
@@ -87,13 +88,16 @@ func (c *ControlPlane) SetNodeState(nodeID string, state model.NodeState) error 
 	return nil
 }
 
-// RemoveNode 删除节点；节点上仍有未删除 VM 时拒绝。
+// RemoveNode 删除节点；节点上仍有未删除 VM 或处于维护排空（Draining）中时拒绝。
 func (c *ControlPlane) RemoveNode(nodeID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n, ok := c.nodes[nodeID]
 	if !ok {
 		return newErr(ReasonNotFound, "node %s not found", nodeID)
+	}
+	if n.State == model.NodeStateDraining {
+		return newErr(ReasonInvalidState, "node %s is draining; finish maintenance before removal", nodeID)
 	}
 	for _, vm := range c.vms {
 		if vm.NodeID == nodeID && vm.State != model.VMStateDeleted {
@@ -137,6 +141,13 @@ func (c *ControlPlane) Audit() []AuditEvent {
 	out := make([]AuditEvent, len(c.audit))
 	copy(out, c.audit)
 	return out
+}
+
+// UsedSnapshot 返回全局已记账资源（用于与各节点账目对账）。
+func (c *ControlPlane) UsedSnapshot() model.Resources {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.used
 }
 
 // ---------- 内部：账目（须持锁） ----------

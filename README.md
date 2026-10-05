@@ -28,11 +28,44 @@ Placing --创建成功--> Stopped --启动--> Running --停止--> Stopped
    |--失败/不确定--> Failed <----启动失败--+
                      |
 任意状态 --删除--> Deleted          （Failed / Deleted 为明确终态）
+
+Stopped/Running/Failed --排空疏散--> Migrating --成功--> 原状态（落在目标节点）
+                          |            |
+                          +--失败/不确定--回滚--> 原节点、原状态、原占用
 ```
 
-- 不存在半完成态：停止失败回到 `Running`；创建失败/不确定回滚账目后进入 `Failed`。
+- 不存在半完成态：停止失败回到 `Running`；创建失败/不确定回滚账目后进入 `Failed`；
+  疏散失败整体回滚到原节点原状态。
 - 每次状态或账目变更追加一条 `AuditEvent`（序号、操作、实例、节点、详情），
   可通过 `ControlPlane.Audit()` 获取，用于解释与审计。
+
+## 节点维护排空与实例疏散
+
+机器要下线维护时，使用 `DrainNode(ctx, nodeID)` + `EndMaintenance(nodeID)`：
+
+- `DrainNode` 将节点切换为 `Draining`：不再接收新放置（与 `Offline` 一样被放置器跳过），
+  随后对节点上每个未删除实例逐一执行疏散，返回逐实例结果 `DrainResult.Results`
+  （搬到哪个节点 / 未搬的可区分原因码与详情）以及 `Complete`（节点是否已清空）。
+- 每个实例的疏散按原有放置规则在目标节点重新判定：节点容量、全局配额、必需能力与
+  版本兼容、显式声明的降级、亲和与反亲和。判定不满足时该实例以原有原因码
+  （`CAPACITY_EXCEEDED` / `QUOTA_EXCEEDED` / `CAPABILITY_MISMATCH` /
+  `CONSTRAINT_VIOLATED` / `NODE_UNAVAILABLE`）拒绝，**留在原节点、状态与占用不变**。
+- 账目边界：疏散是净零迁移——在同一临界区内从源节点出账、向目标节点入账，
+  全局 `used` 不变；任何时刻同一实例只在一个节点上占账，不会出现双节点占账、
+  负账目或重复回收。搬移期间实例处于 `Migrating` 暂态，启动/停止会被拒绝
+  （`INVALID_STATE`），删除仍然可用且与疏散正确汇合（见下）。
+- 后端交互顺序：先在目标后端幂等 `CreateVM`（原状态为 `Running` 再在目标 `StartVM`），
+  全部就绪后才删除源后端实例。目标后端明确失败或结果不确定（`ErrUncertain`）时：
+  先 `QueryVM` 对账并清理目标残留，再整体回滚账目与状态到原节点，结果码为
+  `BACKEND_ERROR` / `BACKEND_UNCERTAIN`，实例不卡在中间态。重试同一排空不会
+  重复占账，也不会在后端留下重复实例。
+- 幂等：同一节点重复或并发调用 `DrainNode` 由内部串行化，已清空的节点再次排空
+  直接返回 `Complete=true`、无重复搬移、无重复后端调用；`EndMaintenance` 重复调用
+  稳定成功，节点恢复 `Ready` 重新投入放置。
+- 处于 `Placing/Starting/Stopping/Migrating` 暂态的实例本轮跳过（结果码
+  `INVALID_STATE`，详情注明原因），其生命周期操作收敛后再次排空即可搬移。
+- 边界：`Draining` 中的节点拒绝 `RemoveNode`；疏散期间实例被并发删除时，账目由
+  删除方在目标节点释放，疏散方不再触碰账目并清理目标后端残留。
 
 ## 并发一致性边界
 
@@ -59,17 +92,33 @@ Placing --创建成功--> Stopped --启动--> Running --停止--> Stopped
   - 停止失败：回到 `Running`；
   - 删除在任何状态下可用且幂等：后端删除失败时控制面仍回收账目并记录可能的后端残留。
 - 节点失联（`Offline`）：不参与新放置，已有账目保留；恢复 `Ready` 后即可继续放置。
-  节点上仍有未删除实例时拒绝移除节点。
+  节点上仍有未删除实例或处于维护排空（`Draining`）中时拒绝移除节点。
+
+## 兼容范围
+
+本轮新增均为增量能力，既有接口与行为不变：
+
+- 新增节点状态 `Draining` 与实例暂态 `Migrating`；既有 `Ready/Offline` 与各实例
+  状态语义不变，`Migrating` 仅出现在排空搬移窗口内。
+- 新增接口 `DrainNode` / `EndMaintenance` / `UsedSnapshot`；`CreateVM`、`StartVM`、
+  `StopVM`、`DeleteVM`、`RegisterNode`、`SetNodeState`、`RemoveNode` 的既有契约不变，
+  仅 `RemoveNode` 增加一条拒绝规则（节点 `Draining` 中拒绝移除）。
+- 放置器跳过非 `Ready` 节点的规则不变，因此 `Draining` 节点自然不再接收新实例。
 
 ## 本地验证
 
 ```sh
 go build ./...        # 编译
+go vet ./...          # 静态检查
 go test ./...         # 全部测试
 go test -race ./...   # 竞态检测
-go run ./cmd/control-demo   # 本地演示：放置、幂等重放、故障注入、审计日志
+go run ./cmd/control-demo   # 本地演示：放置、幂等重放、故障注入、排空疏散、审计日志
 ```
 
 测试覆盖：并发放置（容量不超卖）、容量竞争、配额、并发重复请求、节点失联与恢复、
 后端创建失败/结果不确定、启动失败重试、停止失败回退、删除幂等、能力不匹配与显式
-降级、反亲和约束。断言失败时测试会打印完整操作序列、判定依据与审计日志。
+降级、反亲和约束；排空疏散覆盖：正常排空（状态保留、账目迁移、恢复投入）、
+重复/并发排空幂等、目标容量与反亲和不满足时的拒绝与留位、目标后端失败与结果
+不确定时的整体回滚与重试、排空与并发创建/删除竞争下的账目不变量
+（无超卖、无负账、各节点之和等于全局已用、后端实例与账目所在节点一一对应）。
+断言失败时测试会打印完整操作序列、判定依据与审计日志。

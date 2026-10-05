@@ -53,7 +53,26 @@ func main() {
 
 	vm, _ = cp.StopVM(ctx, vm.ID)
 	fmt.Printf("stopped %s state=%s\n", vm.ID, vm.State)
+
+	// 节点维护排空：node-a 进入维护，实例被疏散到其它节点。
+	vm2spec := model.VMSpec{RequestID: "demo-2", Resources: model.Resources{MilliCPU: 1000, MemoryMB: 1024}}
+	vmb, err := cp.CreateVM(ctx, vm2spec)
+	must(err)
+	fmt.Printf("\ncreated %s on %s\n", vmb.ID, vmb.NodeID)
+	dr, err := cp.DrainNode(ctx, "node-a")
+	must(err)
+	for _, r := range dr.Results {
+		fmt.Printf("evacuate %s: moved=%v to=%s code=%s %s\n", r.VMID, r.Moved, r.ToNode, r.Code, r.Detail)
+	}
+	fmt.Printf("drain node-a complete=%v\n", dr.Complete)
+	na, _ := cp.NodeSnapshot("node-a")
+	fmt.Printf("node-a state=%s allocated=%+v\n", na.State, na.Allocated)
+	must(cp.EndMaintenance("node-a"))
+	na, _ = cp.NodeSnapshot("node-a")
+	fmt.Printf("node-a state=%s after maintenance\n", na.State)
+
 	must(cp.DeleteVM(ctx, vm.ID))
+	must(cp.DeleteVM(ctx, vmb.ID))
 
 	n, _ := cp.NodeSnapshot(vm.NodeID)
 	fmt.Printf("node %s allocated after delete: %+v\n", n.ID, n.Allocated)

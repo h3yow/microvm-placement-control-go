@@ -51,6 +51,9 @@ func (f *Fake) UncertainOn(op string, applyEffect bool) {
 	f.mu.Unlock()
 }
 
+// ClearUncertain 移除指定操作的不确定注入。
+func (f *Fake) ClearUncertain(op string) { f.mu.Lock(); delete(f.uncertain, op); f.mu.Unlock() }
+
 // Calls 返回已记录调用的副本。
 func (f *Fake) Calls() []Call {
 	f.mu.Lock()
